@@ -1,0 +1,304 @@
+# pdf_summarizer.py
+# 基于智谱 AI 的本地 PDF 论文智能总结助手
+# 自动读取 PDF 论文，提取全文内容，生成结构化的论文总结
+
+# 1. 导入必要的库
+import os  # 用于文件和路径操作
+import sys  # 用于系统相关功能
+from pypdf import PdfReader  # 从 pypdf 库导入 PDF 读取器
+from openai import OpenAI  # 从 openai 库导入 OpenAI 客户端类
+
+# 2. 配置智谱 AI 客户端（保持原有配置不变）
+# 创建一个 OpenAI 客户端实例，用于与智谱 AI 的 API 进行通信
+client = OpenAI(
+    # 指定智谱 AI 的 API 基础地址
+    base_url="https://open.bigmodel.cn/api/paas/v4",
+    
+    # 你的智谱 AI API 密钥
+    api_key="d1445eb55b8a49d0a1b2ad3d8b812f03.w3sAU5x6n5tKJNU3",
+    
+    # 设置请求超时时间（秒）
+    # 因为论文可能很长，响应时间会相应增加
+    timeout=120.0,  # 增加到 120 秒以应对长文本处理
+)
+
+# 3. PDF 读取函数
+def read_pdf(file_path="paper.pdf"):
+    """
+    读取本地 PDF 文件，提取所有页面的文字内容
+    
+    参数:
+        file_path (str): PDF 文件的路径，默认为当前目录下的 "paper.pdf"
+    
+    返回:
+        str: 提取出的全部文本内容，如果失败则返回空字符串
+    
+    功能说明:
+        - 使用 pypdf 库逐页读取 PDF
+        - 自动过滤空页面
+        - 在页面间添加分隔符，便于后续处理
+        - 完善的错误处理机制
+    """
+    print(f"📄 正在读取 PDF 文件：{file_path}")
+    print("-" * 60)
+    
+    try:
+        # 3.1 检查文件是否存在
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"找不到文件：{file_path}")
+        
+        # 3.2 创建 PdfReader 对象
+        # PdfReader 是 pypdf 库的核心类，用于读取和解析 PDF 文件
+        reader = PdfReader(file_path)
+        
+        # 3.3 获取 PDF 的总页数
+        # len(reader.pages) 返回 PDF 文档的页面总数
+        total_pages = len(reader.pages)
+        print(f"📊 PDF 总页数：{total_pages} 页")
+        
+        # 3.4 初始化一个列表，用于存储所有页面的文本
+        all_text = []
+        
+        # 3.5 逐页提取文本内容
+        for page_num in range(total_pages):
+            # 获取当前页面对象
+            page = reader.pages[page_num]
+            
+            # 从页面中提取文本
+            # extract_text() 方法会自动识别并提取页面中的所有文字
+            page_text = page.extract_text()
+            
+            # 3.6 过滤空页面并添加页码标记
+            if page_text and page_text.strip():
+                # 为每一页添加页码标记，方便后续引用
+                marked_text = f"[第 {page_num + 1} 页]\n{page_text.strip()}"
+                all_text.append(marked_text)
+                
+                # 显示提取进度
+                text_preview = page_text[:50].replace('\n', ' ')
+                print(f"✅ 第 {page_num + 1}/{total_pages} 页已提取 | 预览：{text_preview}...")
+            else:
+                print(f"⚠️  第 {page_num + 1}/{total_pages} 页为空或无法提取文本")
+        
+        # 3.7 将所有页面的文本拼接成一个完整的字符串
+        # 使用双换行符分隔不同页面，保持结构清晰
+        full_text = "\n\n".join(all_text)
+        
+        # 3.8 统计提取结果
+        total_chars = len(full_text)
+        print(f"\n📈 提取完成！")
+        print(f"   - 有效页数：{len(all_text)}/{total_pages}")
+        print(f"   - 总字符数：{total_chars}")
+        print(f"   - 预估 token 数：约 {total_chars // 4} tokens")  # 粗略估算：中文约 1 token/字，英文约 1 token/4 字符
+        print("-" * 60)
+        print()
+        
+        return full_text
+        
+    except FileNotFoundError as e:
+        print(f"❌ 文件错误：{e}")
+        print("请确保 paper.pdf 文件在当前目录下")
+        return ""
+    except Exception as e:
+        print(f"❌ PDF 读取失败：{e}")
+        print("可能的原因：")
+        print("  1. PDF 文件已损坏")
+        print("  2. PDF 是扫描版图片（无法直接提取文本）")
+        print("  3. PDF 文件受密码保护")
+        return ""
+
+# 4. 论文总结系统提示词
+# 这个提示词定义了 AI 的角色和分析框架
+SYSTEM_PROMPT = """你是一位世界顶尖的 AI 科学家和论文审稿人，拥有以下背景：
+- 在 Nature、Science、ICML、NeurIPS、CVPR 等顶刊顶会发表过 200+ 篇论文
+- 担任多个顶级期刊和会议的程序委员会成员和审稿人
+- 精通机器学习、深度学习、自然语言处理、计算机视觉等 AI 各子领域
+- 擅长快速提取论文核心要点，撰写高质量的论文评审意见
+
+你的任务是对用户提供的学术论文进行深度分析和总结。请严格遵循以下格式，使用精美的 Markdown 排版：
+
+## 📋 一、核心研究背景
+
+*   **研究问题**：[清晰阐述论文试图解决什么科学问题或技术挑战]
+*   **研究动机**：[说明为什么这个问题重要，当前的痛点是什么]
+*   **相关工作脉络**：[简要梳理该领域的研究现状和存在的问题]
+*   **本文定位**：[明确本文在该领域中的位置和贡献定位]
+
+## 💡 二、核心创新点
+
+### 方法创新
+*   **主要创新 1**：[详细描述第一个核心创新点，包括理论或方法上的突破]
+*   **主要创新 2**：[详细描述第二个核心创新点]
+*   **主要创新 3**：[如有更多创新点，继续列出]
+
+### 技术特色
+*   **架构设计**：[描述提出的模型或算法架构的独特之处]
+*   **算法优势**：[说明相比现有方法的优势]
+*   **理论贡献**：[如果论文有理论分析，在此说明]
+
+## 🔬 三、核心实验结论
+
+### 实验设置
+*   **数据集**：[列出使用的主要数据集]
+*   **基线方法**：[列出对比的基线方法]
+*   **评估指标**：[列出主要的性能指标]
+
+### 主要结果
+| 实验项目 | 性能提升 | 对比基线 | 说明 |
+|---------|---------|---------|------|
+| [实验1名称] | [提升幅度] | [最强基线] | [关键发现] |
+| [实验2名称] | [提升幅度] | [最强基线] | [关键发现] |
+
+### 消融实验
+*   [总结消融实验的主要发现和结论]
+
+## ⚠️ 四、局限性与未来展望
+
+### 当前局限
+*   **方法局限**：[指出现有方法的不足和约束条件]
+*   **实验局限**：[指出实验设计或验证的不足]
+*   **理论局限**：[指出理论分析的不完善之处]
+
+### 未来方向
+*   **短期改进**：[可立即着手优化的方向]
+*   **长期探索**：[具有深远意义的研究方向]
+*   **应用前景**：[潜在的产业应用场景]
+
+## 📊 总体评价
+
+**创新性**：⭐️⭐️⭐️⭐️⭐️ [1-5星]
+**严谨性**：⭐️⭐️⭐️⭐️⭐️ [1-5星]
+**可读性**：⭐️⭐️⭐️⭐️⭐️ [1-5星]
+**实用性**：⭐️⭐️⭐️⭐️⭐️ [1-5星]
+
+**总结点评**：[一段话总体评价该论文的贡献和价值]
+
+---
+*注意：如果论文中某些部分的信息不完整，请根据上下文进行合理推断，并在相应位置标注 [推断] 标记。*
+"""
+
+# 5. 主函数：协调 PDF 读取和 AI 总结
+def main():
+    """
+    主函数：读取 PDF 并调用 AI 生成结构化总结
+    """
+    # 5.1 打印程序标题
+    print("=" * 60)
+    print("🤖 本地 PDF 论文智能总结助手 (基于智谱 AI)")
+    print("=" * 60)
+    print()
+    
+    # 5.2 读取 PDF 文件
+    pdf_text = read_pdf("paper.pdf")
+    
+    # 5.3 检查是否成功读取到内容
+    if not pdf_text:
+        print("❌ 无法继续：PDF 内容为空")
+        print("请检查 paper.pdf 文件是否存在且包含可提取的文字")
+        sys.exit(1)  # 非零状态码表示异常退出
+    
+    # 5.4 构建用户消息
+    # 将提取的论文全文包装成用户消息
+    user_message = f"""请按照你的专业标准，对以下学术论文进行深入分析和总结：
+
+=== 论文全文开始 ===
+{pdf_text}
+=== 论文全文结束 ===
+
+请严格按照系统提示中的 Markdown 格式输出完整的论文分析报告。"""
+    
+    # 5.5 检查文本长度
+    # 智谱 AI 的上下文窗口限制（glm-4-flash 支持 128K tokens）
+    # 如果文本过长，给出警告但继续尝试
+    estimated_tokens = len(pdf_text) // 4  # 粗略估算
+    if estimated_tokens > 100000:  # 预留 28000 tokens 给回复
+        print(f"⚠️  警告：论文文本约 {estimated_tokens} tokens，可能超出模型上下文限制")
+        print("程序将继续运行，但如果出现错误请考虑截断论文文本\n")
+    
+    # 5.6 调用 AI 进行论文总结
+    print("🧠 智谱 AI 正在深入分析论文...")
+    print("=" * 60)
+    print()
+    
+    try:
+        # 5.6.1 发起流式聊天请求
+        stream = client.chat.completions.create(
+            # 使用 glm-4-flash 模型（高性价比快速模型）
+            model="glm-4-flash",
+            
+            # 构建消息列表
+            messages=[
+                # 系统消息：定义 AI 角色和输出格式
+                {
+                    "role": "system",
+                    "content": SYSTEM_PROMPT
+                },
+                # 用户消息：包含完整的论文内容
+                {
+                    "role": "user",
+                    "content": user_message
+                }
+            ],
+            
+            # 启用流式输出，实现打字机效果
+            stream=True,
+            
+            # 设置温度参数
+            # 较低的温度 (0.3) 让输出更加确定和严谨，适合学术分析
+            temperature=0.3,
+            
+            # 设置最大输出 tokens
+            # 4000 tokens 足够生成详细的结构化分析报告
+            max_tokens=4000,
+            
+            # 设置 top_p 参数进行核采样
+            # 0.9 表示从累积概率达到 90% 的 tokens 中采样
+            top_p=0.9,
+        )
+        
+        # 5.7 流式输出分析结果
+        print("📝 论文分析报告：")
+        print("=" * 60)
+        print()
+        
+        # 遍历流式响应的每个数据块
+        for chunk in stream:
+            # 检查当前数据块是否包含文本内容
+            if chunk.choices[0].delta.content is not None:
+                # 获取文本增量
+                content = chunk.choices[0].delta.content
+                
+                # 实时打印到终端
+                # end="" 防止自动换行，flush=True 强制立即刷新缓冲区
+                print(content, end="", flush=True)
+        
+        # 输出完成后换行
+        print("\n")
+        print("=" * 60)
+        print("✅ 论文分析完成！")
+        print()
+        print("💡 提示：")
+        print("  - 如需分析其他论文，请将 PDF 文件重命名为 paper.pdf")
+        print("  - 支持中英文论文，但扫描版 PDF 需要先 OCR 处理")
+        print("  - 可以通过修改 SYSTEM_PROMPT 自定义分析维度")
+        
+    except Exception as e:
+        # 5.8 错误处理
+        print(f"\n❌ AI 分析失败：{e}")
+        print("\n可能的原因：")
+        print("  1. 论文文本过长超出模型上下文限制 → 尝试截断文本")
+        print("  2. API 配额不足 → 检查智谱 AI 账户余额")
+        print("  3. 网络连接问题 → 检查网络状态")
+        print("  4. API Key 失效 → 确认密钥是否有效")
+        sys.exit(1)
+
+# 6. 程序入口点
+if __name__ == "__main__":
+    """
+    程序入口
+    使用方法：
+    1. 将你的论文 PDF 文件命名为 paper.pdf 放在同一目录下
+    2. 运行：python pdf_summarizer.py
+    3. 等待 AI 生成结构化分析报告
+    """
+    main()
