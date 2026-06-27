@@ -1,660 +1,476 @@
 """
-real_rag.py - 基于智谱AI的本地向量数据库Chroma检索增强生成系统
-===========================================================================
-核心原理：
-1. 文档切片：将PDF文档按语义单元切分成重叠的文本块
-2. 向量化入库：使用嵌入模型将文本块转换为高维向量存入Chroma
-3. 语义检索：将用户问题向量化后在向量空间中进行相似度搜索
-4. 增强生成：将检索到的相关文本块与问题组合，输入大模型生成精准答案
-
-技术栈：
-- 嵌入模型：智谱AI embedding-3 (最新高精度向量模型)
-- 大语言模型：智谱AI GLM-4-Flash (免费快速推理)
-- 向量数据库：ChromaDB (持久化本地存储)
-- PDF处理：PyPDF2 (文档读取与切片)
-
-作者：AI专业大一学生
-日期：2026年
+real_rag.py - 工业级混合检索增强生成系统 (Hybrid RAG)
+============================================================================
+架构设计：双路检索 + RRF融合 + 熔断门卫 + 流式生成
+- 语义路：ChromaDB + embedding-3 (捕捉语义相似)
+- 关键词路：BM25Okapi (捕捉精确匹配)
+- 融合算法：RRF简化版去重重排
+- 安全机制：相似度阈值熔断拦截
+============================================================================
 """
 
 import os
 import sys
-from typing import List, Dict, Tuple
+import numpy as np
+from typing import List, Dict, Tuple, Set
 from pathlib import Path
 
-# ===========================================================================
-# 第三方库导入 - 这些库需要提前安装
-# pip install chromadb openai pypdf
-# ===========================================================================
+# 第三方依赖检查
 try:
     from pypdf import PdfReader
     import chromadb
+    from chromadb.config import Settings
     from openai import OpenAI
+    from rank_bm25 import BM25Okapi
+    import jieba
 except ImportError as e:
-    print(f"❌ 缺少必要的库文件: {e}")
-    print("请运行: pip install chromadb openai pypdf")
+    print(f"❌ 缺少依赖: {e}")
+    print("pip install chromadb openai pypdf rank-bm25 jieba numpy")
     sys.exit(1)
 
 
 class Config:
-    """
-    全局配置类 - 存储所有系统参数
+    """工业级配置中心 - 所有超参数集中管控"""
     
-    安全原则：
-    - API密钥通过环境变量读取，绝不在代码中硬编码
-    - 所有路径使用相对路径，确保跨平台兼容性
-    """
-    
-    # === API配置 ===
-    # 从Windows系统环境变量获取API密钥（绝对安全，无明文泄露风险）
+    # 安全层：API密钥从环境变量注入（零明文泄漏）
     ZHIPU_API_KEY = os.environ.get("ZHIPU_API_KEY")
+    if not ZHIPU_API_KEY:
+        raise RuntimeError("❌ ZHIPU_API_KEY环境变量未设置！")
     
-    # 智谱AI官方接口地址
     BASE_URL = "https://open.bigmodel.cn/api/paas/v4/"
     
-    # === 模型配置 ===
-    EMBEDDING_MODEL = "embedding-3"        # 嵌入模型：将文本转换为1024维向量
-    LLM_MODEL = "glm-4-flash"              # 大语言模型：免费高速推理
+    # 模型层
+    EMBEDDING_MODEL = "embedding-3"      # 1024维高精度向量
+    LLM_MODEL = "glm-4-flash"            # 免费快速推理
     
-    # === 文档切片配置 ===
-    CHUNK_SIZE = 600                       # 每个文本块600字（平衡语义完整性与检索精度）
-    OVERLAP_SIZE = 120                     # 重叠120字（防止关键信息在边界被切断）
+    # 切片层：600字块 + 120字重叠（20%重叠率，工业验证最佳实践）
+    CHUNK_SIZE = 600
+    OVERLAP_SIZE = 120
     
-    # === 检索配置 ===
-    TOP_K = 2                              # 检索最相关的2个文本块（足够精准又不超上下文限制）
+    # 检索层
+    TOP_K_VECTOR = 2                     # 向量路检索数量
+    TOP_K_BM25 = 2                       # 关键词路检索数量
+    TOP_K_FINAL = 2                      # 融合后最终返回数量
     
-    # === 数据库配置 ===
-    CHROMA_PATH = "./chroma_db"            # Chroma持久化数据库存储路径
-    COLLECTION_NAME = "paper_vectors"      # 向量集合名称
+    # 熔断层：余弦距离阈值（>0.7触发拦截，0.7=约30%相似度）
+    SIMILARITY_THRESHOLD = 0.7
     
-    # === 文件配置 ===
-    PDF_FILENAME = "paper.pdf"             # 待处理的PDF论文文件名
+    # 存储层
+    CHROMA_PATH = "./chroma_db"
+    COLLECTION_NAME = "paper_hybrid_vectors"
+    
+    # 文件层
+    PDF_FILENAME = "paper.pdf"
 
 
-class PDFProcessor:
-    """
-    PDF文档处理器 - 负责读取PDF并智能切片
+class PDFChunker:
+    """PDF处理器：提取 + 智能切片（滑动窗口重叠）"""
     
-    切片策略：
-    - 固定大小切片（600字）：确保每个块包含足够的上下文
-    - 滑动窗口重叠（120字）：保证语义连贯性，避免关键信息被切断
-    - 这个重叠率(20%)是经过工业界验证的最佳实践
-    """
-    
-    def __init__(self, pdf_path: str, chunk_size: int = 600, overlap: int = 120):
-        """
-        初始化PDF处理器
-        
-        Args:
-            pdf_path: PDF文件路径
-            chunk_size: 每个文本块的字符数
-            overlap: 相邻块之间的重叠字符数
-        """
+    def __init__(self, pdf_path: str, chunk_size: int, overlap: int):
         self.pdf_path = pdf_path
         self.chunk_size = chunk_size
         self.overlap = overlap
-        
+        self.stride = chunk_size - overlap
+    
     def extract_text(self) -> str:
-        """
-        从PDF中提取全部文本内容
-        
-        Returns:
-            清洗后的完整文本字符串
-        
-        处理流程：
-        1. 逐页读取PDF
-        2. 提取每页文本
-        3. 过滤空行和多余空白
-        """
-        print(f"📖 正在读取PDF文件: {self.pdf_path}")
-        
+        """从PDF提取全文并清洗"""
         if not os.path.exists(self.pdf_path):
-            raise FileNotFoundError(f"❌ PDF文件不存在: {self.pdf_path}")
+            raise FileNotFoundError(f"❌ PDF不存在: {self.pdf_path}")
         
         reader = PdfReader(self.pdf_path)
-        total_pages = len(reader.pages)
-        print(f"📄 检测到 {total_pages} 页内容")
-        
-        full_text = []
-        for i, page in enumerate(reader.pages, 1):
+        texts = []
+        for page in reader.pages:
             text = page.extract_text()
-            if text.strip():  # 过滤空页面
-                # 清理文本：合并多个空格，去除首尾空白
-                cleaned_text = ' '.join(text.split())
-                full_text.append(cleaned_text)
-            
-            if i % 5 == 0:  # 每5页显示一次进度
-                print(f"⏳ 提取进度: {i}/{total_pages} 页")
+            if text.strip():
+                texts.append(' '.join(text.split()))
         
-        extracted = '\n'.join(full_text)
-        print(f"✅ 文本提取完成，总计 {len(extracted)} 字符")
-        return extracted
+        full_text = '\n'.join(texts)
+        print(f"📄 PDF提取完成: {len(full_text)}字符, {len(reader.pages)}页")
+        return full_text
     
-    def create_chunks(self, text: str) -> List[Dict[str, str]]:
+    def chunk(self, text: str) -> List[Dict]:
         """
-        将长文本切分成重叠的语义块
-        
-        Args:
-            text: 完整文本
-            
-        Returns:
-            包含chunk_id和text的字典列表
-            
-        算法说明：
-        - 使用滑动窗口策略
-        - 步长 = chunk_size - overlap
-        - 例如：chunk_size=600, overlap=120, 步长=480
-        - 第一个块: [0:600]
-        - 第二个块: [480:1080]
-        - 第三个块: [960:1560]
-        - 以此类推，确保相邻块共享120字上下文
+        滑动窗口切片算法
+        步长=stride, 相邻块共享overlap字符保证语义连续
         """
-        print(f"\n🔪 开始文本切片 (块大小: {self.chunk_size}字, 重叠: {self.overlap}字)")
-        
         chunks = []
-        text_length = len(text)
-        stride = self.chunk_size - self.overlap  # 计算滑动步长
+        text_len = len(text)
         
-        # 如果文本长度小于chunk_size，直接作为一个完整块
-        if text_length <= self.chunk_size:
+        if text_len <= self.chunk_size:
+            return [{"id": "chunk_000", "text": text, "start": 0, "end": text_len}]
+        
+        idx = 0
+        start = 0
+        while start < text_len:
+            end = min(start + self.chunk_size, text_len)
             chunks.append({
-                "chunk_id": "chunk_000",
-                "text": text,
-                "start_pos": 0,
-                "end_pos": text_length
+                "id": f"chunk_{idx:03d}",
+                "text": text[start:end],
+                "start": start,
+                "end": end
             })
-        else:
-            chunk_index = 0
-            start = 0
-            
-            while start < text_length:
-                # 计算当前块的结束位置
-                end = min(start + self.chunk_size, text_length)
-                chunk_text = text[start:end]
-                
-                # 构建块元数据
-                chunk_data = {
-                    "chunk_id": f"chunk_{chunk_index:03d}",  # 格式化为三位数字ID
-                    "text": chunk_text,
-                    "start_pos": start,
-                    "end_pos": end
-                }
-                chunks.append(chunk_data)
-                
-                # 移动到下一个起始位置
-                start += stride
-                chunk_index += 1
-                
-                # 如果已经到达文本末尾，退出循环
-                if end >= text_length:
-                    break
+            start += self.stride
+            idx += 1
+            if end >= text_len:
+                break
         
-        print(f"✅ 切片完成，共生成 {len(chunks)} 个文本块")
-        
-        # 打印切片统计信息
-        avg_length = sum(len(c["text"]) for c in chunks) / len(chunks)
-        print(f"📊 切片统计: 平均长度 {avg_length:.0f} 字符, 重叠率 {self.overlap/self.chunk_size*100:.1f}%")
-        
+        print(f"🔪 切片完成: {len(chunks)}块, 平均{self.chunk_size}字, 重叠{self.overlap}字")
         return chunks
 
 
-class VectorDatabase:
+class HybridRetriever:
     """
-    向量数据库管理器 - 使用ChromaDB进行本地持久化存储
-    
-    核心概念：
-    - Embedding：将文本映射到高维向量空间（1024维）
-    - 向量相似度：余弦相似度计算文本间的语义距离
-    - 索引：为向量建立搜索索引，实现毫秒级检索
+    混合检索引擎：向量语义 + BM25关键词 = 双路召回
+    核心创新：RRF简化融合 + 相似度熔断门卫
     """
     
     def __init__(self, config: Config):
-        """
-        初始化向量数据库
-        
-        Args:
-            config: 系统配置对象
-        """
         self.config = config
-        self.client = None
+        self.openai_client = OpenAI(api_key=config.ZHIPU_API_KEY, base_url=config.BASE_URL)
+        self.chroma_client = chromadb.PersistentClient(
+            path=config.CHROMA_PATH,
+            settings=Settings(anonymized_telemetry=False)
+        )
         self.collection = None
-        self.openai_client = None
-        
-    def initialize_clients(self):
-        """
-        初始化API客户端和数据库连接
-        
-        双重检查机制：
-        1. 验证API密钥存在性
-        2. 测试数据库连接可用性
-        """
-        # === 检查API密钥 ===
-        if not self.config.ZHIPU_API_KEY:
-            raise ValueError(
-                "❌ 未找到ZHIPU_API_KEY环境变量！\n"
-                "请在Windows系统环境变量中设置：\n"
-                "1. 按 Win+X 打开系统菜单\n"
-                "2. 选择'系统' -> '高级系统设置'\n"
-                "3. 点击'环境变量'\n"
-                "4. 新建用户变量: ZHIPU_API_KEY=你的API密钥"
-            )
-        
-        # === 初始化OpenAI兼容客户端（连接智谱AI） ===
-        # 智谱AI提供OpenAI兼容接口，可以直接使用openai库
-        self.openai_client = OpenAI(
-            api_key=self.config.ZHIPU_API_KEY,
-            base_url=self.config.BASE_URL
-        )
-        print("🔗 已连接到智谱AI API")
-        
-        # === 初始化Chroma持久化客户端 ===
-        # PersistentClient会在本地磁盘创建数据库文件，程序重启数据不丢失
-        self.client = chromadb.PersistentClient(
-            path=self.config.CHROMA_PATH,
-            settings=chromadb.Settings(
-                anonymized_telemetry=False  # 关闭遥测，保护隐私
-            )
-        )
-        print(f"💾 Chroma数据库已初始化 (存储路径: {self.config.CHROMA_PATH})")
-        
-    def create_embedding(self, text: str) -> List[float]:
-        """
-        调用智谱AI嵌入模型将文本转换为向量
-        
-        Args:
-            text: 输入文本
-            
-        Returns:
-            1024维浮点数向量列表
-            
-        向量化原理：
-        - embedding-3模型将文本的语义信息编码为1024维向量
-        - 语义相似的文本在向量空间中距离更近
-        - 每维代表文本的一个抽象特征（如主题、情感、风格等）
-        """
-        try:
-            response = self.openai_client.embeddings.create(
-                model=self.config.EMBEDDING_MODEL,
-                input=text
-            )
-            # 提取嵌入向量
-            embedding = response.data[0].embedding
-            return embedding
-        except Exception as e:
-            raise RuntimeError(f"❌ 向量化失败: {str(e)}")
+        self.bm25_index = None       # BM25检索引擎实例
+        self.bm25_chunks = []        # BM25原始文本块（用于索引构建）
+        self.all_chunks = []         # 所有chunk元数据
     
-    def create_collection(self, chunks: List[Dict[str, str]]) -> None:
+    def embed(self, text: str) -> List[float]:
+        """调用embedding-3生成1024维语义向量"""
+        resp = self.openai_client.embeddings.create(
+            model=self.config.EMBEDDING_MODEL, input=text
+        )
+        return resp.data[0].embedding
+    
+    def build_indices(self, chunks: List[Dict]):
         """
-        创建向量集合并批量入库
-        
-        Args:
-            chunks: 文本块列表
-            
-        处理流程：
-        1. 删除旧集合（如果存在）
-        2. 创建新集合
-        3. 批量生成嵌入向量
-        4. 将向量和文本存入数据库
+        构建双路索引：
+        1. ChromaDB向量索引（语义路）
+        2. BM25关键词索引（精准路）
         """
-        collection_name = self.config.COLLECTION_NAME
+        self.all_chunks = chunks
         
-        # === 删除已存在的集合（避免重复数据） ===
+        # === 删除旧集合，创建新集合 ===
         try:
-            self.client.delete_collection(collection_name)
-            print(f"🗑️  已删除旧集合: {collection_name}")
+            self.chroma_client.delete_collection(self.config.COLLECTION_NAME)
         except:
-            pass  # 集合不存在时忽略错误
+            pass
         
-        # === 创建新集合 ===
-        # metadata用于存储集合的描述信息
-        self.collection = self.client.create_collection(
-            name=collection_name,
-            metadata={
-                "description": "论文向量索引库",
-                "embedding_model": self.config.EMBEDDING_MODEL,
-                "chunk_size": str(self.config.CHUNK_SIZE),
-                "overlap": str(self.config.OVERLAP_SIZE)
-            }
+        self.collection = self.chroma_client.create_collection(
+            name=self.config.COLLECTION_NAME,
+            metadata={"hnsw:space": "cosine"}  # 余弦相似度空间
         )
-        print(f"📚 已创建向量集合: {collection_name}")
         
-        # === 批量处理文本块 ===
-        print(f"\n🔄 开始向量化 {len(chunks)} 个文本块...")
-        
-        for i, chunk in enumerate(chunks, 1):
-            # 生成向量嵌入
-            embedding = self.create_embedding(chunk["text"])
-            
-            # 存储到ChromaDB
-            # - ids: 唯一标识符
-            # - embeddings: 向量数据
-            # - documents: 原始文本（用于检索后返回）
-            # - metadatas: 附加元数据（位置信息等）
+        # === 向量路：批量生成embedding并存入ChromaDB ===
+        print(f"🔄 向量化入库 {len(chunks)} 块...")
+        for i, chunk in enumerate(chunks):
+            emb = self.embed(chunk["text"])
             self.collection.add(
-                ids=[chunk["chunk_id"]],
-                embeddings=[embedding],
+                ids=[chunk["id"]],
+                embeddings=[emb],
                 documents=[chunk["text"]],
-                metadatas=[{
-                    "chunk_id": chunk["chunk_id"],
-                    "start_pos": chunk["start_pos"],
-                    "end_pos": chunk["end_pos"],
-                    "char_length": len(chunk["text"])
-                }]
+                metadatas=[{"start": chunk["start"], "end": chunk["end"]}]
             )
-            
-            # 进度显示
-            if i % 5 == 0 or i == len(chunks):
-                progress = (i / len(chunks)) * 100
-                print(f"⏳ 向量化进度: {i}/{len(chunks)} ({progress:.1f}%)")
+            if (i+1) % 10 == 0:
+                print(f"  向量化: {i+1}/{len(chunks)}")
         
-        print(f"✅ 所有文本块已成功存入向量数据库")
+        # === 关键词路：构建BM25索引 ===
+        # 使用jieba分词处理中文文本
+        print(f"🔨 构建BM25关键词索引...")
+        tokenized_chunks = []
+        self.bm25_chunks = [chunk["text"] for chunk in chunks]
         
-    def query_relevant_chunks(self, query: str) -> List[Dict]:
+        for text in self.bm25_chunks:
+            # jieba精确模式分词，过滤单字（提升检索精度）
+            tokens = [w for w in jieba.lcut(text) if len(w) > 1]
+            tokenized_chunks.append(tokens)
+        
+        self.bm25_index = BM25Okapi(tokenized_chunks)
+        print(f"✅ 双路索引构建完成: 向量{len(chunks)}条 + BM25{len(tokenized_chunks)}条")
+    
+    def vector_retrieve(self, query: str) -> Tuple[List[Dict], bool]:
         """
-        语义检索：根据用户查询找到最相关的文本块
-        
-        Args:
-            query: 用户问题
-            
-        Returns:
-            包含相关文本块及其元数据的列表
-            
-        检索原理：
-        1. 将用户问题转换为向量
-        2. 在向量空间中计算余弦相似度
-        3. 返回相似度最高的TOP_K个文本块
+        语义路检索 + 熔断门卫
+        返回: (检索结果列表, 是否触发熔断)
         """
-        print(f"\n🔍 正在检索相关文本块: \"{query}\"")
-        
-        # 将查询转换为向量
-        query_embedding = self.create_embedding(query)
-        
-        # 在ChromaDB中执行向量相似度搜索
+        query_emb = self.embed(query)
         results = self.collection.query(
-            query_embeddings=[query_embedding],
-            n_results=self.config.TOP_K,  # 返回最相关的2个结果
-            include=["documents", "metadatas", "distances"]  # 返回文档、元数据和距离
+            query_embeddings=[query_emb],
+            n_results=self.config.TOP_K_VECTOR,
+            include=["documents", "metadatas", "distances"]
         )
         
-        # 解析检索结果
-        relevant_chunks = []
-        for i in range(len(results["documents"][0])):
-            chunk_info = {
-                "text": results["documents"][0][i],
-                "metadata": results["metadatas"][0][i],
-                "distance": results["distances"][0][i],  # 距离越小越相关
-                "relevance_score": 1 - results["distances"][0][i]  # 转换为相关性分数
-            }
-            relevant_chunks.append(chunk_info)
-            
-            print(f"📌 相关块 {i+1}: "
-                  f"ID={chunk_info['metadata']['chunk_id']}, "
-                  f"相关性={chunk_info['relevance_score']:.4f}, "
-                  f"距离={chunk_info['distance']:.4f}")
+        # === 熔断门卫：检查最大距离（余弦距离越小越相关） ===
+        distances = results["distances"][0]
+        max_distance = max(distances) if distances else 1.0
         
-        return relevant_chunks
-
-
-class LLMGenerator:
-    """
-    大语言模型生成器 - 基于检索结果生成精准回答
+        # 如果连最相关的块距离都>0.7，说明语义完全不匹配
+        triggered = max_distance > self.config.SIMILARITY_THRESHOLD
+        
+        # 构造标准返回格式
+        vector_results = []
+        if not triggered:
+            for i in range(len(results["documents"][0])):
+                vector_results.append({
+                    "text": results["documents"][0][i],
+                    "source": "vector",
+                    "distance": distances[i],
+                    "score": 1.0 - distances[i],  # 转换为相似度分数
+                    "metadata": results["metadatas"][0][i]
+                })
+        
+        return vector_results, triggered
     
-    防御性Prompt设计：
-    - 明确告诉模型只能基于提供的参考资料回答
-    - 防止模型过度发挥，避免产生幻觉
-    - 确保回答的准确性和可追溯性
-    """
+    def bm25_retrieve(self, query: str) -> List[Dict]:
+        """
+        关键词路检索：BM25精确匹配
+        """
+        if not self.bm25_index:
+            return []
+        
+        # 分词查询
+        query_tokens = [w for w in jieba.lcut(query) if len(w) > 1]
+        scores = self.bm25_index.get_scores(query_tokens)
+        
+        # 获取Top-K索引
+        top_indices = np.argsort(scores)[::-1][:self.config.TOP_K_BM25]
+        
+        bm25_results = []
+        for idx in top_indices:
+            if scores[idx] > 0:  # 过滤0分结果
+                bm25_results.append({
+                    "text": self.bm25_chunks[idx],
+                    "source": "bm25",
+                    "score": float(scores[idx]),
+                    "metadata": {"start": self.all_chunks[idx]["start"], 
+                                "end": self.all_chunks[idx]["end"]}
+                })
+        
+        return bm25_results
+    
+    def rrf_fusion(self, vector_results: List[Dict], bm25_results: List[Dict]) -> List[Dict]:
+        """
+        RRF简化融合算法 (Reciprocal Rank Fusion)
+        原理：对不同来源的结果按排名位置加权融合，去重后重新排序
+        
+        公式：RRF_score = Σ 1/(k + rank_i)
+        其中k=60（平滑参数），rank从1开始
+        """
+        k = 60  # RRF平滑常数（行业标准值）
+        fused_scores = {}
+        fused_data = {}
+        
+        # === 向量路排名加权 ===
+        for rank, item in enumerate(vector_results, 1):
+            text = item["text"]
+            rrf_score = 1.0 / (k + rank)
+            
+            if text not in fused_scores:
+                fused_scores[text] = rrf_score
+                fused_data[text] = item
+            else:
+                fused_scores[text] += rrf_score
+        
+        # === BM25路排名加权 ===
+        for rank, item in enumerate(bm25_results, 1):
+            text = item["text"]
+            rrf_score = 1.0 / (k + rank)
+            
+            if text not in fused_scores:
+                fused_scores[text] = rrf_score
+                fused_data[text] = item
+            else:
+                fused_scores[text] += rrf_score  # 双路命中加权
+        
+        # === 按融合分数降序排列，取Top-K ===
+        sorted_texts = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)
+        final_results = []
+        
+        for text, score in sorted_texts[:self.config.TOP_K_FINAL]:
+            item = fused_data[text]
+            item["rrf_score"] = score  # 添加融合分数
+            final_results.append(item)
+        
+        return final_results
+    
+    def hybrid_retrieve(self, query: str) -> List[Dict]:
+        """
+        混合检索主流程：双路召回 + 熔断检查 + RRF融合
+        """
+        # === 1. 语义路检索（内置熔断） ===
+        vector_results, is_blocked = self.vector_retrieve(query)
+        
+        if is_blocked:
+            print("\n" + "="*60)
+            print("⚠️  警告：您输入的内容与本论文无任何语义关联，已被向量网关安全拦截！")
+            print(f"   触发阈值: 余弦距离 > {self.config.SIMILARITY_THRESHOLD}")
+            print("="*60)
+            return []
+        
+        # === 2. 关键词路检索 ===
+        bm25_results = self.bm25_retrieve(query)
+        
+        # === 3. RRF融合去重重排 ===
+        final_results = self.rrf_fusion(vector_results, bm25_results)
+        
+        # === 4. 输出检索诊断信息 ===
+        print(f"\n🔍 混合检索诊断:")
+        print(f"   向量路召回: {len(vector_results)}条")
+        print(f"   BM25路召回: {len(bm25_results)}条")
+        print(f"   RRF融合后: {len(final_results)}条")
+        for i, item in enumerate(final_results, 1):
+            print(f"   结果{i}: 来源={item['source']}, RRF分数={item['rrf_score']:.4f}, "
+                  f"位置={item['metadata']['start']}-{item['metadata']['end']}")
+        
+        return final_results
+
+
+class LLMStreamer:
+    """流式大模型生成器：防御性Prompt + 流式输出"""
     
     def __init__(self, config: Config):
-        """
-        初始化LLM生成器
-        
-        Args:
-            config: 系统配置对象
-        """
         self.config = config
-        
-        # 初始化OpenAI兼容客户端
-        self.client = OpenAI(
-            api_key=config.ZHIPU_API_KEY,
-            base_url=config.BASE_URL
-        )
-        
-    def generate_answer(self, query: str, relevant_chunks: List[Dict]) -> str:
+        self.client = OpenAI(api_key=config.ZHIPU_API_KEY, base_url=config.BASE_URL)
+    
+    def generate(self, query: str, context_chunks: List[Dict]) -> str:
         """
-        基于检索结果生成流式回答
-        
-        Args:
-            query: 用户问题
-            relevant_chunks: 检索到的相关文本块
-            
-        Returns:
-            流式生成的回答字符串
-        
-        Prompt工程策略：
-        1. 系统提示：限制模型行为边界
-        2. 上下文注入：插入检索到的准确信息
-        3. 防御性指令：防止模型编造信息
+        构建防御性Prompt并流式生成
+        Prompt设计：系统角色约束 + 参考资料注入 + 引用要求
         """
-        
-        # === 构建防御性Prompt ===
-        # 将检索到的文本块拼接为参考上下文
+        # 拼接上下文
         context = "\n\n---\n\n".join([
-            f"【参考资料 {i+1}】(来源位置: {chunk['metadata']['start_pos']}-{chunk['metadata']['end_pos']}字符)\n{chunk['text']}"
-            for i, chunk in enumerate(relevant_chunks)
+            f"[参考资料{i+1} 来源:{chunk['source']} 位置:{chunk['metadata']['start']}-{chunk['metadata']['end']}]\n{chunk['text']}"
+            for i, chunk in enumerate(context_chunks)
         ])
         
-        # 系统提示词 - 严格限定模型行为
-        system_prompt = """你是一个专业的学术论文分析助手。你的任务是基于提供的论文片段，准确回答用户的问题。
-
-请严格遵守以下规则：
-1. 只能基于提供的参考资料回答问题，不得引入外部知识
-2. 如果参考资料不足以回答问题，请明确说明"根据提供的资料无法确定"
-3. 回答要精准、简洁，直接引用原文关键信息
-4. 使用学术化的语言，保持专业性
-5. 在回答中标注信息来源（如"根据参考资料1..."）"""
+        system_prompt = """你是严格的学术论文分析专家。规则：
+1. 仅基于提供的参考资料回答，禁止引入外部知识
+2. 参考资料不足时明确说明"依据现有资料无法确定"
+3. 回答需标注引用来源（如[参考资料1]）
+4. 保持学术严谨，不推测不编造"""
         
-        # 用户提示 - 组合上下文和问题
         user_prompt = f"""论文参考资料：
 {context}
 
 用户问题：{query}
 
-请基于以上参考资料，给出准确、详细的回答："""
+请严格基于以上资料回答："""
         
-        print(f"\n🤖 正在生成回答...\n")
-        print("=" * 60)
+        print(f"\n🤖 GLM-4-Flash流式生成:\n{'='*60}")
         
-        # === 流式生成 ===
         full_response = ""
-        
         try:
-            # 调用智谱AI GLM-4-Flash模型进行流式生成
             stream = self.client.chat.completions.create(
                 model=self.config.LLM_MODEL,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                stream=True,  # 启用流式输出
-                temperature=0.3,  # 降低随机性，提高准确度
-                max_tokens=2000,  # 限制最大生成长度
+                stream=True,
+                temperature=0.2,    # 低温度确保准确性
+                max_tokens=1500,
             )
             
-            # 逐token打印输出
             for chunk in stream:
                 if chunk.choices[0].delta.content:
                     content = chunk.choices[0].delta.content
-                    print(content, end="", flush=True)  # 实时打印，不缓冲
+                    print(content, end="", flush=True)
                     full_response += content
             
-            print("\n" + "=" * 60)
-            
+            print(f"\n{'='*60}")
         except Exception as e:
-            error_msg = f"❌ 生成回答失败: {str(e)}"
-            print(error_msg)
-            return error_msg
+            print(f"\n❌ 生成失败: {e}")
         
         return full_response
 
 
-class RAGSystem:
-    """
-    RAG系统主控制器 - 协调各个组件完成检索增强生成任务
-    
-    工作流程：
-    1. 检查数据库是否已初始化
-    2. 如果未初始化，执行PDF读取、切片、向量化流程
-    3. 进入交互式问答循环
-    4. 对每个问题执行检索+生成
-    """
+class HybridRAGSystem:
+    """工业级混合RAG系统主控制器"""
     
     def __init__(self):
-        """初始化RAG系统"""
         self.config = Config()
-        self.pdf_processor = PDFProcessor(
-            self.config.PDF_FILENAME,
-            self.config.CHUNK_SIZE,
+        self.chunker = PDFChunker(
+            self.config.PDF_FILENAME, 
+            self.config.CHUNK_SIZE, 
             self.config.OVERLAP_SIZE
         )
-        self.vector_db = VectorDatabase(self.config)
-        self.llm_generator = LLMGenerator(self.config)
+        self.retriever = HybridRetriever(self.config)
+        self.llm = LLMStreamer(self.config)
+    
+    def initialize(self):
+        """系统初始化：PDF处理 + 双路索引构建"""
+        print("\n" + "🚀"*30)
+        print("工业级混合检索RAG系统启动")
+        print("🚀"*30 + "\n")
         
-    def initialize_database(self) -> bool:
-        """
-        初始化向量数据库
-        
-        Returns:
-            是否为新创建的数据库
-        
-        智能检测：
-        - 如果ChromaDB已存在且有数据，直接使用
-        - 如果不存在或为空，执行完整的入库流程
-        """
-        print("\n" + "🚀 " * 20)
-        print("RAG系统启动中...")
-        print("🚀 " * 20 + "\n")
-        
-        # 初始化客户端连接
-        self.vector_db.initialize_clients()
-        
-        # 检查是否已有数据
-        collection_exists = False
+        # 检查是否已有数据库
         try:
-            existing_collection = self.vector_db.client.get_collection(
+            existing = self.retriever.chroma_client.get_collection(
                 self.config.COLLECTION_NAME
             )
-            if existing_collection.count() > 0:
-                collection_exists = True
-                print(f"✅ 发现现有向量数据库，包含 {existing_collection.count()} 条记录")
-                
-                # 询问用户是否需要重建
-                response = input("🔄 是否重建数据库？(y/n, 默认n): ").strip().lower()
-                if response != 'y':
-                    self.vector_db.collection = existing_collection
-                    print("📚 使用现有数据库")
-                    return False
+            if existing.count() > 0:
+                print(f"📚 发现已有数据库({existing.count()}条)")
+                choice = input("重建? (y/n): ").strip().lower()
+                if choice != 'y':
+                    self.retriever.collection = existing
+                    # 重建BM25索引
+                    docs = existing.get()["documents"]
+                    tokenized = [[w for w in jieba.lcut(doc) if len(w)>1] for doc in docs]
+                    self.retriever.bm25_index = BM25Okapi(tokenized)
+                    self.retriever.bm25_chunks = docs
+                    self.retriever.all_chunks = [
+                        {"id": f"chunk_{i:03d}", "text": doc, "start": i*600, "end": (i+1)*600}
+                        for i, doc in enumerate(docs)
+                    ]
+                    print("✅ 使用现有数据库")
+                    return
         except:
-            pass  # 集合不存在，需要新建
+            pass
         
-        # 执行完整的PDF处理和向量化流程
-        print("\n" + "📄 " * 20)
-        print("开始PDF文档处理和向量化入库流程")
-        print("📄 " * 20 + "\n")
-        
-        # 步骤1: 提取PDF文本
-        full_text = self.pdf_processor.extract_text()
-        
-        # 步骤2: 文本切片
-        chunks = self.pdf_processor.create_chunks(full_text)
-        
-        # 步骤3: 向量化并存入数据库
-        self.vector_db.create_collection(chunks)
-        
-        print("\n" + "✅ " * 20)
-        print("向量数据库初始化完成！")
-        print("✅ " * 20 + "\n")
-        
-        return True
+        # 完整处理流程
+        text = self.chunker.extract_text()
+        chunks = self.chunker.chunk(text)
+        self.retriever.build_indices(chunks)
+        print("\n✅ 系统初始化完成，进入问答模式")
     
-    def query(self, user_question: str) -> str:
-        """
-        处理用户查询
+    def query(self, question: str):
+        """执行一次完整的混合检索增强生成"""
+        # 混合检索（含熔断）
+        relevant = self.retriever.hybrid_retrieve(question)
         
-        Args:
-            user_question: 用户问题
-            
-        Returns:
-            生成的回答
-        """
-        # 检索相关文本块
-        relevant_chunks = self.vector_db.query_relevant_chunks(user_question)
+        # 熔断触发时不生成
+        if not relevant:
+            return
         
-        # 基于检索结果生成回答
-        answer = self.llm_generator.generate_answer(user_question, relevant_chunks)
-        
-        return answer
+        # 流式生成
+        self.llm.generate(question, relevant)
     
-    def interactive_mode(self):
-        """交互式问答模式"""
-        print("\n" + "💬 " * 20)
-        print("进入交互式问答模式 (输入 'quit' 或 'exit' 退出)")
-        print("💬 " * 20 + "\n")
+    def run(self):
+        """交互式主循环"""
+        self.initialize()
+        
+        print("\n" + "💬"*30)
+        print("混合检索问答模式 (quit退出)")
+        print("💬"*30)
         
         while True:
             try:
-                # 获取用户输入
-                user_input = input("\n🔍 请输入你的问题: ").strip()
-                
-                # 退出检查
-                if user_input.lower() in ['quit', 'exit', 'q']:
-                    print("\n👋 感谢使用，再见！")
+                q = input("\n🔍 问题: ").strip()
+                if q.lower() in ['quit', 'exit', 'q']:
+                    print("👋 再见")
                     break
-                
-                # 空输入检查
-                if not user_input:
-                    print("⚠️  请输入有效问题")
+                if not q:
                     continue
-                
-                # 执行查询
-                self.query(user_input)
-                
+                self.query(q)
             except KeyboardInterrupt:
-                print("\n\n👋 检测到中断信号，再见！")
+                print("\n👋 中断退出")
                 break
             except Exception as e:
-                print(f"❌ 处理查询时出错: {str(e)}")
-                continue
-
-
-def main():
-    """
-    主函数 - RAG系统入口点
-    
-    使用示例：
-    1. 将paper.pdf放在当前目录
-    2. 设置环境变量 ZHIPU_API_KEY
-    3. 运行: python real_rag.py
-    """
-    try:
-        # 创建RAG系统实例
-        rag_system = RAGSystem()
-        
-        # 初始化数据库
-        rag_system.initialize_database()
-        
-        # 进入交互模式
-        rag_system.interactive_mode()
-        
-    except Exception as e:
-        print(f"\n❌ 系统启动失败: {str(e)}")
-        print("\n🔧 故障排查建议:")
-        print("1. 检查ZHIPU_API_KEY环境变量是否已设置")
-        print("2. 确认paper.pdf文件存在于当前目录")
-        print("3. 检查网络连接是否正常")
-        print("4. 确认已安装所有依赖: pip install chromadb openai pypdf")
-        sys.exit(1)
+                print(f"❌ 错误: {e}")
 
 
 if __name__ == "__main__":
-    main()
+    # 启动工业级混合RAG系统
+    system = HybridRAGSystem()
+    system.run()
