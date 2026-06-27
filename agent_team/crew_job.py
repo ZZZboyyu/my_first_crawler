@@ -35,7 +35,7 @@ import re
 
 # 【重要】把你的智谱AI API Key 粘贴到下面的字符串里
 # 获取地址：https://bigmodel.cn/usercenter/proj-mgmt/apikeys
-ZHIPU_API_KEY = "d1445eb55b8a49d0a1b2ad3d8b812f03.w3sAU5x6n5tKJNU3"  # ← 替换这里！！！
+ZHIPU_API_KEY = os.environ.get("ZHIPU_API_KEY")  # ← 替换这里！！！
 
 # 创建智谱AI的客户端（使用OpenAI标准格式）
 # 这相当于给CrewAI配置了一个"大脑"
@@ -159,7 +159,7 @@ task_a = Task(
     请阅读以下PDF论文全文，并提取关键信息。
     
     PDF论文内容：
-    {read_pdf_file("paper.pdf")}  # ← 这里会自动读取本地的paper.pdf文件
+    {read_pdf_file("paper.pdf")}
     
     提取要求：
     1. 研究背景：用3-5句话概括，说明"为什么要做这个研究"
@@ -168,16 +168,15 @@ task_a = Task(
     
     输出格式：请用清晰的Markdown标题分类输出。
     """,
-    agent=researcher,  # 指派给特工A
+    agent=researcher,
     expected_output="""一份结构清晰的学术素材摘要，包含：
     ## 研究背景
     ## 核心创新点  
-    ## 核心实验数据""",  # 期望的输出格式
+    ## 核心实验数据""",
     verbose=True,
 )
 
 
-# 定义Task B - 写作任务
 task_b = Task(
     description="""
     【任务B：中文趣味报告撰写】
@@ -198,11 +197,11 @@ task_b = Task(
     
     要求：语言生动活泼，排版精美，让非专业人士也能看懂！
     """,
-    agent=writer,  # 指派给特工B
-    expected_output="""一篇排版精美、带小图标的中文趣味学术报告，
+    agent=writer,
+    expected_output="""一篇排版精美，带小图标的中文趣味学术报告，
     结构清晰，语言通俗易懂，适合大一新生阅读。""",
     verbose=True,
-    context=[task_a],  # 重要！依赖Task A的输出作为输入
+    context=[task_a],
 )
 
 
