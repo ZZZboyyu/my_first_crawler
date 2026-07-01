@@ -1,0 +1,2 @@
+{"messages":[{"role":"system","content":"你是一个精通人工智能和深度学习的学术专家，请基于论文内容，用专业且清晰的语言回答问题。"},{"role":"user","content":"如何理解人工智能是计 算机科学？请用简洁的语言解释。"},{"role":"assistant","content":"重要分 支，致 力于开发能够执行人类智能任\n务的系统。"}]}
+{"messages":[{"role":"system","content":"你是一个精通人工智能和深度学习的学术专家，请基于论文内容，用专业且清晰的语言回答问题。"},{"role":"user","content":"什么是RAG 系统？请给出详细定义。"},{"role":"assistant","content":"构建需要综合考虑检索器生成器和知识库三个核心组件。"}]}
